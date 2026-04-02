@@ -1,109 +1,255 @@
 require("test/mocks")
 
--- Make xmpparser available without the plugin's package.path manipulation
 package.path = package.path .. ";./lib/?.lua"
-local XMPParser = require("xmpparser")
+local CalibreMetadata = require("calibremetadata")
 
 -- ---------------------------------------------------------------------------
--- XMPParser unit tests
+-- Helpers
 -- ---------------------------------------------------------------------------
 
-describe("XMPParser.parseCalibreFields", function()
+--- Write text to a temp file and return its path.
+local function writeTmp(name, content)
+    local path = "/tmp/pdfmeta_test_" .. name
+    local f = assert(io.open(path, "w"))
+    f:write(content)
+    f:close()
+    return path
+end
 
-    -- Minimal XMP as Calibre actually writes it
-    local SAMPLE_XMP = [[
-<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
-  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-    <rdf:Description rdf:about=""
-        xmlns:dc="http://purl.org/dc/elements/1.1/"
-        xmlns:calibre="http://calibre.kovidgoyal.net/2009/metadata"
-        dc:language="es"
-        calibre:series="Fundación"
-        calibre:series_index="1.0">
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end="w"?>
-    ]]
+local function removeTmp(path)
+    os.remove(path)
+end
 
-    -- XMP with dc:language inside an rdf:Alt list (another common form)
-    local SAMPLE_XMP_LANG_LIST = [[
-<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
-  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-    <rdf:Description rdf:about=""
-        xmlns:dc="http://purl.org/dc/elements/1.1/"
-        xmlns:calibre="http://calibre.kovidgoyal.net/2009/metadata"
-        calibre:series="Dune"
-        calibre:series_index="2.0">
-      <dc:language>
-        <rdf:Alt>
-          <rdf:li xml:lang="x-default">en</rdf:li>
-        </rdf:Alt>
-      </dc:language>
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end="w"?>
-    ]]
+-- ---------------------------------------------------------------------------
+-- CalibreMetadata.parseJSON
+-- ---------------------------------------------------------------------------
 
-    local SAMPLE_XMP_ENTITIES = [[
-<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
-  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-    <rdf:Description rdf:about=""
-        xmlns:calibre="http://calibre.kovidgoyal.net/2009/metadata"
-        calibre:series="Tom &amp; Jerry Adventures"
-        calibre:series_index="3.0">
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end="w"?>
-    ]]
+describe("CalibreMetadata.parseJSON", function()
 
-    it("parses series, series_index and language from attribute-style XMP", function()
-        local meta = XMPParser.parseCalibreFields(SAMPLE_XMP)
-        assert.equals("Fundación", meta.series)
-        assert.equals(1.0,        meta.series_index)
-        assert.equals("es",       meta.language)
+    it("parses a minimal book record", function()
+        local json = [[
+[
+  {
+    "lpath": "Author/Book.pdf",
+    "series": "Foundation",
+    "series_index": 1.0,
+    "languages": ["es"],
+    "authors": ["Isaac Asimov"]
+  }
+]
+        ]]
+        local records = CalibreMetadata.parseJSON(json)
+        assert.is_table(records)
+        assert.equals(1, #records)
+        assert.equals("Foundation", records[1].series)
+        assert.equals(1.0,          records[1].series_index)
+        assert.equals("es",         records[1].languages[1])
     end)
 
-    it("parses series_index as a number", function()
-        local meta = XMPParser.parseCalibreFields(SAMPLE_XMP)
-        assert.is_number(meta.series_index)
+    it("parses multiple records", function()
+        local json = [[
+[
+  {"lpath": "a.pdf", "series": "Dune",       "series_index": 1},
+  {"lpath": "b.pdf", "series": "Foundation", "series_index": 2}
+]
+        ]]
+        local records = CalibreMetadata.parseJSON(json)
+        assert.equals(2, #records)
+        assert.equals("Dune",       records[1].series)
+        assert.equals("Foundation", records[2].series)
     end)
 
-    it("parses dc:language from rdf:Alt list", function()
-        local meta = XMPParser.parseCalibreFields(SAMPLE_XMP_LANG_LIST)
-        assert.equals("Dune", meta.series)
-        assert.equals(2.0,    meta.series_index)
-        assert.equals("en",   meta.language)
+    it("handles unicode escape sequences", function()
+        local json = [[[ {"series": "Fundaci\u00f3n"} ]]]
+        local records = CalibreMetadata.parseJSON(json)
+        -- ó is U+00F3; encoded as UTF-8: 0xC3 0xB3
+        assert.equals("Fundaci\xC3\xB3n", records[1].series)
     end)
 
-    it("decodes XML entities in series name", function()
-        local meta = XMPParser.parseCalibreFields(SAMPLE_XMP_ENTITIES)
-        assert.equals("Tom & Jerry Adventures", meta.series)
+    it("returns nil for empty input", function()
+        local result, err = CalibreMetadata.parseJSON("")
+        assert.is_nil(result)
+        assert.is_string(err)
     end)
 
-    it("returns empty table for nil input", function()
-        local meta = XMPParser.parseCalibreFields(nil)
-        assert.is_table(meta)
-        assert.is_nil(meta.series)
-        assert.is_nil(meta.series_index)
-        assert.is_nil(meta.language)
+    it("returns nil for nil input", function()
+        local result = CalibreMetadata.parseJSON(nil)
+        assert.is_nil(result)
     end)
 
-    it("returns empty table when no calibre fields present", function()
-        local xmp = [[<?xpacket begin="" id="x"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>]]
-        local meta = XMPParser.parseCalibreFields(xmp)
-        assert.is_nil(meta.series)
-        assert.is_nil(meta.language)
+    it("parses boolean and null values without crashing", function()
+        local json = [[[ {"flag": true, "missing": false, "nothing": null} ]]]
+        local records = CalibreMetadata.parseJSON(json)
+        assert.is_table(records)
+        assert.is_true(records[1].flag)
+        assert.is_false(records[1].missing)
+        assert.is_nil(records[1].nothing)
     end)
+
 end)
 
 -- ---------------------------------------------------------------------------
--- PdfMeta integration: file scanning
+-- CalibreMetadata.findRecord
+-- ---------------------------------------------------------------------------
+
+describe("CalibreMetadata.findRecord", function()
+
+    local records = {
+        { lpath = "Asimov/Foundation.pdf",      series = "Foundation", series_index = 1 },
+        { lpath = "Herbert/Dune.pdf",            series = "Dune",       series_index = 1 },
+        { lpath = "Herbert/Dune Messiah.pdf",    series = "Dune",       series_index = 2 },
+    }
+
+    it("finds a record by filename", function()
+        local rec = CalibreMetadata.findRecord(records, "/books/Asimov/Foundation.pdf")
+        assert.is_not_nil(rec)
+        assert.equals("Foundation", rec.series)
+    end)
+
+    it("finds the correct record when filenames differ only by directory", function()
+        local rec = CalibreMetadata.findRecord(records, "/books/Herbert/Dune Messiah.pdf")
+        assert.is_not_nil(rec)
+        assert.equals(2, rec.series_index)
+    end)
+
+    it("returns nil when no record matches", function()
+        local rec = CalibreMetadata.findRecord(records, "/books/Unknown/Other.pdf")
+        assert.is_nil(rec)
+    end)
+
+    it("returns nil for empty records table", function()
+        local rec = CalibreMetadata.findRecord({}, "/books/Asimov/Foundation.pdf")
+        assert.is_nil(rec)
+    end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- CalibreMetadata.findSidecar
+-- ---------------------------------------------------------------------------
+
+describe("CalibreMetadata.findSidecar", function()
+
+    local base    = "/tmp/pdfmeta_sidecar_test"
+    local subdir  = base .. "/Author"
+    local sidecar = base .. "/.metadata.calibre"
+
+    before_each(function()
+        os.execute("mkdir -p " .. string.format("%q", subdir))
+        -- Write a dummy sidecar at library root
+        local f = assert(io.open(sidecar, "w"))
+        f:write("[]")
+        f:close()
+    end)
+
+    after_each(function()
+        os.execute("rm -rf " .. string.format("%q", base))
+    end)
+
+    it("finds sidecar in the same directory as the PDF", function()
+        -- Put another sidecar directly in subdir
+        local local_sidecar = subdir .. "/.metadata.calibre"
+        local f = assert(io.open(local_sidecar, "w"))
+        f:write("[]")
+        f:close()
+        local found = CalibreMetadata.findSidecar(subdir .. "/Book.pdf")
+        assert.equals(local_sidecar, found)
+    end)
+
+    it("finds sidecar one level up when not present locally", function()
+        local found = CalibreMetadata.findSidecar(subdir .. "/Book.pdf")
+        assert.equals(sidecar, found)
+    end)
+
+    it("returns nil when no sidecar exists anywhere", function()
+        os.remove(sidecar)
+        local found = CalibreMetadata.findSidecar(subdir .. "/Book.pdf")
+        assert.is_nil(found)
+    end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- CalibreMetadata.getMetadata  (end-to-end)
+-- ---------------------------------------------------------------------------
+
+describe("CalibreMetadata.getMetadata", function()
+
+    local base   = "/tmp/pdfmeta_e2e_test"
+    local subdir = base .. "/Asimov"
+
+    before_each(function()
+        os.execute("mkdir -p " .. string.format("%q", subdir))
+    end)
+
+    after_each(function()
+        os.execute("rm -rf " .. string.format("%q", base))
+    end)
+
+    it("returns series, series_index and language from sidecar", function()
+        local sidecar_path = base .. "/.metadata.calibre"
+        local f = assert(io.open(sidecar_path, "w"))
+        f:write([[
+[
+  {
+    "lpath": "Asimov/Foundation.pdf",
+    "series": "Foundation",
+    "series_index": 1.0,
+    "languages": ["es"]
+  }
+]
+        ]])
+        f:close()
+
+        -- Create a dummy PDF so lfs could find it (path only needed)
+        local pdf_path = subdir .. "/Foundation.pdf"
+        local pf = assert(io.open(pdf_path, "w"))
+        pf:write("dummy")
+        pf:close()
+
+        local meta = CalibreMetadata.getMetadata(pdf_path)
+        assert.equals("Foundation", meta.series)
+        assert.equals(1.0,          meta.series_index)
+        assert.equals("es",         meta.language)
+    end)
+
+    it("returns empty table when no sidecar exists", function()
+        local meta = CalibreMetadata.getMetadata(subdir .. "/NoSidecar.pdf")
+        assert.is_table(meta)
+        assert.is_nil(meta.series)
+    end)
+
+    it("returns empty table when PDF not listed in sidecar", function()
+        local sidecar_path = base .. "/.metadata.calibre"
+        local f = assert(io.open(sidecar_path, "w"))
+        f:write([[[ {"lpath": "Asimov/Other.pdf", "series": "X"} ]]])
+        f:close()
+
+        local meta = CalibreMetadata.getMetadata(subdir .. "/Foundation.pdf")
+        assert.is_table(meta)
+        assert.is_nil(meta.series)
+    end)
+
+    it("series_index is returned as a number", function()
+        local sidecar_path = base .. "/.metadata.calibre"
+        local f = assert(io.open(sidecar_path, "w"))
+        f:write([[[ {"lpath": "Asimov/Foundation.pdf", "series": "Foundation", "series_index": 3} ]]])
+        f:close()
+
+        local pdf_path = subdir .. "/Foundation.pdf"
+        local pf = assert(io.open(pdf_path, "w"))
+        pf:write("dummy")
+        pf:close()
+
+        local meta = CalibreMetadata.getMetadata(pdf_path)
+        assert.is_number(meta.series_index)
+        assert.equals(3, meta.series_index)
+    end)
+
+end)
+
+-- ---------------------------------------------------------------------------
+-- PdfMeta integration: file scanning (unchanged)
 -- ---------------------------------------------------------------------------
 
 describe("PdfMeta file scanning", function()
@@ -115,12 +261,11 @@ describe("PdfMeta file scanning", function()
         os.execute("rm -rf " .. string.format("%q", test_root))
         os.execute("mkdir -p " .. string.format("%q", subdir))
 
-        -- Create dummy PDF files (empty content is fine for path scanning)
         for _, p in ipairs({
             test_root .. "/book1.pdf",
             test_root .. "/book2.pdf",
             subdir    .. "/subbook.pdf",
-            test_root .. "/notapdf.txt",  -- should be ignored
+            test_root .. "/notapdf.txt",
         }) do
             local f = io.open(p, "w")
             f:write("dummy")

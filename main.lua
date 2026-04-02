@@ -1,15 +1,17 @@
 --[[--
-Plugin for KOReader to extract Calibre metadata from PDF files as Custom Metadata.
+Plugin for KOReader to import Calibre metadata from .metadata.calibre sidecar
+files as KOReader Custom Metadata.
 
-Reads the XMP packet embedded by Calibre and writes series, series_index and
-language into KOReader's DocSettings so they appear in the book browser just
-like natively supported fields.
+Reads the .metadata.calibre JSON file written by Calibre when it syncs a
+library to a device, and writes series, series_index and language into
+KOReader's custom_metadata.lua (inside the book's .sdr folder) so they
+appear in "Book information" just like properties set by long-pressing a
+field.
 
 @module koplugin.PdfMeta
 --]]
 
 local plugin_path = debug.getinfo(1, "S").source:sub(2):match("(.*/)")
--- Añadir la carpeta raíz y lib/ a la ruta de búsqueda
 package.path = package.path .. ";" .. plugin_path .. "?.lua;" .. plugin_path .. "lib/?.lua"
 
 local Dispatcher      = require("dispatcher")
@@ -26,7 +28,10 @@ local logger          = require("logger")
 local T               = ffiUtil.template
 local _               = require("gettext")
 
-local XMPParser = require("xmpparser")   -- ¡Corregido!
+local CalibreMetadata = require("calibremetadata")
+
+-- Name of the custom metadata file KOReader reads, located inside book.sdr/
+local CUSTOM_METADATA_FILENAME = "custom_metadata.lua"
 
 local PdfMeta = WidgetContainer:extend({
     name = "pdfmeta",
@@ -66,60 +71,118 @@ function PdfMeta:addToMainMenu(menu_items)
 end
 
 -- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
+
+--- Serialize a Lua value to a string (subset: strings, numbers, booleans,
+-- flat tables with string keys). Sufficient for custom_metadata.lua.
+local function serialize(val, indent)
+    indent = indent or ""
+    local t = type(val)
+    if t == "string" then
+        return string.format("%q", val)
+    elseif t == "number" or t == "boolean" then
+        return tostring(val)
+    elseif t == "table" then
+        local inner = indent .. "    "
+        local parts = {}
+        local keys = {}
+        for k in pairs(val) do keys[#keys + 1] = k end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(keys) do
+            local v = val[k]
+            local key_str = type(k) == "string"
+                and string.format("[%q]", k)
+                or  string.format("[%s]", tostring(k))
+            parts[#parts + 1] = inner .. key_str .. " = " .. serialize(v, inner) .. ","
+        end
+        if #parts == 0 then return "{}" end
+        return "{\n" .. table.concat(parts, "\n") .. "\n" .. indent .. "}"
+    end
+    return "nil"
+end
+
+--- Read an existing custom_metadata.lua and return its data table, or {}.
+local function readCustomMetadata(path)
+    local f = io.open(path, "r")
+    if not f then return {} end
+    local content = f:read("*a")
+    f:close()
+    local chunk = load(content)
+    if not chunk then return {} end
+    local ok, data = pcall(chunk)
+    if not ok or type(data) ~= "table" then return {} end
+    return data
+end
+
+--- Write data to custom_metadata.lua (write to .tmp then rename).
+local function writeCustomMetadata(path, data)
+    local tmp = path .. ".tmp"
+    local f = io.open(tmp, "w")
+    if not f then return false end
+    f:write("-- KOReader custom metadata\nreturn ")
+    f:write(serialize(data))
+    f:write("\n")
+    f:close()
+    return os.rename(tmp, path)
+end
+
+--- Ensure a directory exists.
+local function ensureDir(dir)
+    if lfs.attributes(dir, "mode") ~= "directory" then
+        lfs.mkdir(dir)
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Core: process a single PDF file
 -- ---------------------------------------------------------------------------
 
---- Extract Calibre metadata from *pdf_file* and write it to DocSettings.
+--- Import Calibre metadata for *pdf_file* into its custom_metadata.lua.
 --
 -- @param pdf_file string: absolute path to the PDF
--- @return boolean: true on success
+-- @return boolean: true on success (including "nothing to do")
 function PdfMeta:processFile(pdf_file)
     logger.dbg("PdfMeta -> processFile", pdf_file)
 
-    local meta = XMPParser.getMetadata(pdf_file)
+    local meta = CalibreMetadata.getMetadata(pdf_file)
 
-    -- Nothing useful found — still counts as "processed without error"
     if not meta.series and not meta.series_index and not meta.language then
-        logger.dbg("PdfMeta -> processFile: no Calibre XMP fields found in", pdf_file)
+        logger.dbg("PdfMeta -> no Calibre metadata found for", pdf_file)
         return true
     end
 
-    logger.dbg("PdfMeta -> processFile meta", meta)
+    logger.dbg("PdfMeta -> processFile meta:", meta)
 
-    -- Keys must match KOReader's internal property names
-    local new_props = {}
-    if meta.series       then new_props.series       = meta.series       end
-    if meta.series_index then new_props.series_index = meta.series_index end
-    if meta.language     then new_props.language     = meta.language     end
+    -- Locate (or create) the .sdr sidecar directory for this book.
+    -- DocSettings:getSidecarDir() returns e.g. /path/to/Book.sdr
+    local sdr_dir = DocSettings:getSidecarDir(pdf_file)
+    ensureDir(sdr_dir)
 
-    -- Abrir la configuración del documento
-    local doc_settings = DocSettings:open(pdf_file)
-    if not doc_settings then
-        logger.dbg(T(_("PdfMeta: failed to open DocSettings for: %1"), pdf_file))
+    local custom_metadata_path = sdr_dir .. "/" .. CUSTOM_METADATA_FILENAME
+
+    -- Read existing custom_metadata.lua — may not exist yet.
+    -- KOReader's format: { custom_props = {...}, doc_props = {...} }
+    local data = readCustomMetadata(custom_metadata_path)
+    if type(data.custom_props) ~= "table" then
+        data.custom_props = {}
+    end
+    if type(data.doc_props) ~= "table" then
+        data.doc_props = {}
+    end
+
+    -- Merge: only overwrite fields we actually have from Calibre.
+    if meta.series       then data.custom_props.series       = meta.series       end
+    if meta.series_index then data.custom_props.series_index = meta.series_index end
+    if meta.language     then data.custom_props.language     = meta.language     end
+
+    local ok = writeCustomMetadata(custom_metadata_path, data)
+    if not ok then
+        logger.dbg("PdfMeta -> failed to write", custom_metadata_path)
         return false
     end
 
-    -- Leer los metadatos personalizados existentes
-    local custom_props = doc_settings:readSetting("custom_props") or {}
-    
-    -- Guardar una copia de los valores originales por si se quiere revertir
-    -- (opcional: almacenar en otra clave, por ejemplo "custom_props_backup")
-    -- Por ahora solo los guardamos en la clave "custom_props_original" para depuración
-    local original = {}
-    for key in pairs(new_props) do
-        original[key] = custom_props[key]
-    end
-    doc_settings:saveSetting("custom_props_original", original)
-
-    -- Fusionar los nuevos valores
-    for key, value in pairs(new_props) do
-        custom_props[key] = value
-    end
-    doc_settings:saveSetting("custom_props", custom_props)
-    
-    -- Escribir los cambios al archivo .sdr/metadata.lua
-    doc_settings:flush()
-
+    logger.dbg("PdfMeta -> wrote", custom_metadata_path)
     return true
 end
 
@@ -127,11 +190,6 @@ end
 -- Folder scanning
 -- ---------------------------------------------------------------------------
 
---- Recursively (or not) collect .pdf files under *folder*.
---
--- @param folder    string
--- @param recursive boolean
--- @return table: list of absolute paths
 function PdfMeta:scanForPdfFiles(folder, recursive)
     logger.dbg("PdfMeta -> scanForPdfFiles", folder, "recursive:", recursive)
 
@@ -165,10 +223,6 @@ function PdfMeta:scanForPdfFiles(folder, recursive)
     return pdf_files
 end
 
---- Return true when *folder* contains at least one non-sidecar subdirectory.
---
--- @param folder string
--- @return boolean
 function PdfMeta:hasSubdirectories(folder)
     for entry in lfs.dir(folder) do
         if entry ~= "." and entry ~= ".." then
@@ -181,10 +235,6 @@ function PdfMeta:hasSubdirectories(folder)
     return false
 end
 
---- Process all PDFs in *folder*, with optional recursion and Trapper UI.
---
--- @param folder    string
--- @param recursive boolean
 function PdfMeta:processAllPdfs(folder, recursive)
     logger.dbg("PdfMeta -> processAllPdfs", folder, "recursive:", recursive)
 
@@ -215,7 +265,7 @@ function PdfMeta:processAllPdfs(folder, recursive)
         local real_path = ffiUtil.realpath(file_path)
 
         doNotAbort = Trapper:info(
-            T(_("Extracting metadata...\n%1 / %2"), idx, #pdf_files),
+            T(_("Importing metadata...\n%1 / %2"), idx, #pdf_files),
             true
         )
         if not doNotAbort then
@@ -237,7 +287,7 @@ function PdfMeta:processAllPdfs(folder, recursive)
     Trapper:clear()
     UIManager:show(InfoMessage:new({
         text = T(
-            _("PDF metadata extraction complete.\nSuccessfully extracted %1 / %2"),
+            _("Calibre metadata import complete.\nSuccessfully imported %1 / %2"),
             successes,
             #pdf_files
         ),
@@ -261,13 +311,14 @@ function PdfMeta:onPdfMeta()
     Trapper:wrap(function()
         local go_on = Trapper:confirm(
             _([[
-This will extract Calibre metadata (series, series index, language)
-from PDF files in the current directory.
+This will import Calibre metadata (series, series index, language)
+from the .metadata.calibre file in the current directory into each
+book's KOReader sidecar, so they appear in "Book information".
 
-Once extraction has started you can abort at any moment by tapping
+Once import has started you can abort at any moment by tapping
 the screen.
 
-It is recommended to keep the device plugged in during extraction.]]),
+It is recommended to keep the device plugged in during import.]]),
             _("Cancel"),
             _("Continue")
         )
@@ -276,7 +327,7 @@ It is recommended to keep the device plugged in during extraction.]]),
         local recursive = false
         if self:hasSubdirectories(current_folder) then
             recursive = Trapper:confirm(
-                _("Subfolders detected.\nAlso extract metadata from PDFs in subdirectories?"),
+                _("Subfolders detected.\nAlso import metadata for PDFs in subdirectories?"),
                 _("Here only"),
                 _("Here and under")
             )
