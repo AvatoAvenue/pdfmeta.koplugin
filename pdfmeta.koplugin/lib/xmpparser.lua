@@ -9,8 +9,8 @@ Handles all known serialisation forms Calibre and PDF producers use:
   Attribute form (compact RDF):
     <rdf:Description calibre:series="X" calibre:series_index="1" dc:language="es" .../>
 
-  Element form with rdf:Bag / rdf:Seq / rdf:Alt:
-    <dc:language><rdf:Bag><rdf:li>es</rdf:li></rdf:Bag></dc:language>
+  Element form with rdf:Bag / rdf:Seq / rdf:Alt (multiple languages):
+    <dc:language><rdf:Bag><rdf:li>de</rdf:li><rdf:li>es</rdf:li></rdf:Bag></dc:language>
 
   Plain element form:
     <dc:language>es</dc:language>
@@ -108,7 +108,7 @@ local function trim(s)
 end
 
 -- ---------------------------------------------------------------------------
--- Field extraction — three strategies, tried in order
+-- Field extraction — four strategies, tried in order
 -- ---------------------------------------------------------------------------
 
 --[[
@@ -117,9 +117,6 @@ Strategy 1: Attribute-style compact RDF.
                        dc:language="es" ...>
 --]]
 local function extractAttribute(xmp, ns, tag)
-    -- namespace URI may appear as a different prefix; try both the known
-    -- short prefix and any prefix bound to the namespace URI.
-    -- For our purposes the prefix IS always "calibre" or "dc" in Calibre output.
     local pattern = ns .. ":" .. tag .. '%s*=%s*"([^"]*)"'
     local v = xmp:match(pattern)
     if not v then
@@ -131,43 +128,63 @@ local function extractAttribute(xmp, ns, tag)
 end
 
 --[[
-Strategy 2: Plain element value.
-  <calibre:series>Foundation</calibre:series>
+Strategy 2: Plain element value (no nested rdf:Bag).
   <dc:language>es</dc:language>
 --]]
-local function extractElement(xmp, ns, tag)
-    local pattern = "<" .. ns .. ":" .. tag .. "[^>]*>%s*(.-)%s*</" .. ns .. ":" .. tag .. ">"
-    local v = trim(xmp:match(pattern))
-    -- Reject values that look like nested XML
-    if v and v ~= "" and not v:find("^<") then
-        return decodeEntities(v)
+local function extractPlainLanguage(xmp, ns, tag)
+    local pattern = "<" .. ns .. ":" .. tag .. "[^>]*>%s*([^<]+)%s*</" .. ns .. ":" .. tag .. ">"
+    local v = xmp:match(pattern)
+    if v then
+        v = trim(v)
+        if v ~= "" and v ~= "und" then
+            return decodeEntities(v)
+        end
     end
     return nil
 end
 
 --[[
 Strategy 3: Element containing rdf:Bag / rdf:Seq / rdf:Alt.
-  <dc:language><rdf:Bag><rdf:li>es</rdf:li></rdf:Bag></dc:language>
-  <dc:language><rdf:Alt><rdf:li xml:lang="x-default">es</rdf:li></rdf:Alt></dc:language>
-  Returns the first non-empty rdf:li value.
+  <dc:language><rdf:Bag><rdf:li>de</rdf:li><rdf:li>es</rdf:li></rdf:Bag></dc:language>
+  Returns all non-empty, non-"und" values concatenated with ", ".
 --]]
 local function extractListElement(xmp, ns, tag)
     -- Find the outer element block
-    local outer = xmp:match("<" .. ns .. ":" .. tag .. "[^>]*>(.-)</" .. ns .. ":" .. tag .. ">")
-    if not outer then return nil end
-    -- Grab each rdf:li and return the first non-empty one
+    local start_tag = "<" .. ns .. ":" .. tag
+    local end_tag = "</" .. ns .. ":" .. tag .. ">"
+    local outer_start, outer_end = xmp:find(start_tag .. "[^>]*>(.-)" .. end_tag)
+    if not outer_start then return nil end
+    local outer = xmp:sub(outer_start, outer_end)
+
+    local langs = {}
     for item in outer:gmatch("<rdf:li[^>]*>%s*(.-)%s*</rdf:li>") do
         item = trim(item)
-        if item and item ~= "" and not item:find("^<") then
-            return decodeEntities(item)
+        if item and item ~= "" and item ~= "und" then
+            langs[#langs+1] = decodeEntities(item)
         end
+    end
+    if #langs > 0 then
+        return table.concat(langs, ", ")
     end
     return nil
 end
 
---- Try all three strategies for a given namespace:tag.
+--[[
+Strategy 4: Plain element value that may contain whitespace (fallback).
+--]]
+local function extractElement(xmp, ns, tag)
+    local pattern = "<" .. ns .. ":" .. tag .. "[^>]*>%s*(.-)%s*</" .. ns .. ":" .. tag .. ">"
+    local v = trim(xmp:match(pattern))
+    if v and v ~= "" and not v:find("^<") then
+        return decodeEntities(v)
+    end
+    return nil
+end
+
+--- Try all four strategies for a given namespace:tag.
 local function extract(xmp, ns, tag)
     return extractAttribute(xmp, ns, tag)
+        or extractPlainLanguage(xmp, ns, tag)
         or extractListElement(xmp, ns, tag)
         or extractElement(xmp, ns, tag)
 end
@@ -175,13 +192,6 @@ end
 -- ---------------------------------------------------------------------------
 -- PDF document-level language (/Lang entry)
 -- ---------------------------------------------------------------------------
-
---[[
-Some PDFs store the language in the document catalog as:
-  /Lang (es)   or   /Lang (es-ES)
-This is NOT XMP but is a reliable fallback for PDFs that have no dc:language
-in their XMP.  We scan for it in the same head/tail chunk we already have.
---]]
 
 --- Extract /Lang entry from raw PDF bytes.
 -- @param pdf_path string
@@ -224,8 +234,6 @@ end
 -- newlines) into a single space, which is safe because XMP/XML treats all
 -- whitespace as equivalent in mixed content.
 local function normaliseWS(s)
-    -- Replace every sequence of whitespace (including \r, \n, \t) with a
-    -- single space, then trim the ends.
     return s:gsub("%s+", " ")
 end
 
@@ -250,18 +258,14 @@ function XMPParser.parseCalibreFields(xmp)
     local si = extract(flat, "calibre", "series_index")
     if si then result.series_index = tonumber(si) or si end
 
-    -- dc:language — try all three strategies; collect ALL rdf:li values and
-    -- take the first one that is not "und" (indeterminate).
-    -- We override extractListElement here to return ALL items so we can pick
-    -- the best one (e.g. prefer "es" over "de" if the PDF has both).
-    -- For now we just take the first non-"und" entry, which matches Calibre's
-    -- own behaviour (it uses languages[0]).
+    -- language
     local lang = extract(flat, "dc", "language")
-    if lang and lang ~= "und" and lang ~= "" then
+    logger.dbg("XMPParser: extracted language =", lang)
+    if lang and lang ~= "" and lang ~= "und" then
         result.language = lang
     end
 
-    logger.dbg("XMPParser.parseCalibreFields:", result)
+    logger.dbg("XMPParser.parseCalibreFields final:", result)
     return result
 end
 
