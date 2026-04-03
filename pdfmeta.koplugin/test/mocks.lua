@@ -1,4 +1,4 @@
--- Mocks for KOReader modules used by pdfmeta.koplugin tests
+-- Mocks for KOReader modules used by pdfmeta.koplugin tests. Claude certified (?
 
 package.preload["libs/libkoreader-lfs"] = function()
     return {
@@ -23,10 +23,8 @@ package.preload["libs/libkoreader-lfs"] = function()
             if stat then
                 local mode = stat:read("*l")
                 stat:close()
-                if mode == "directory" then
-                    return { mode = "directory" }
-                elseif mode then
-                    return { mode = "file" }
+                if mode == "directory" then return { mode = "directory" }
+                elseif mode            then return { mode = "file" }
                 end
             end
             return nil
@@ -40,12 +38,12 @@ end
 
 package.preload["ui/trapper"] = function()
     return {
-        info                    = function() return true end,
-        confirm                 = function() return true end,
-        clear                   = function() end,
-        wrap                    = function(_, fn) if fn then fn() end end,
+        info                       = function() return true end,
+        confirm                    = function() return true end,
+        clear                      = function() end,
+        wrap                       = function(_, fn) if fn then fn() end end,
         dismissableRunInSubprocess = function(_, fn) return true, fn() end,
-        setPausedText           = function() end,
+        setPausedText              = function() end,
     }
 end
 
@@ -55,18 +53,9 @@ end
 
 package.preload["docsettings"] = function()
     return {
-        openSettingsFile = function()
-            return {
-                readSetting        = function() return {} end,
-                saveSetting        = function() end,
-                flushCustomMetadata = function() end,
-            }
-        end,
-        open = function()
-            return {
-                saveSetting = function() end,
-                flush       = function() end,
-            }
+        -- Returns <pdf_path_without_extension>.sdr
+        getSidecarDir = function(_, pdf_path)
+            return (pdf_path:match("^(.+)%.[^%.]+$") or pdf_path) .. ".sdr"
         end,
     }
 end
@@ -77,9 +66,7 @@ end
 
 package.preload["apps/filemanager/filemanager"] = function()
     return {
-        instance = {
-            file_chooser = { path = "/tmp/pdfmeta_test" },
-        },
+        instance = { file_chooser = { path = "/tmp/pdfmeta_test" } },
     }
 end
 
@@ -114,8 +101,9 @@ end
 
 package.preload["logger"] = function()
     return {
-        dbg = function() end,
-        err = function() end,
+        dbg  = function() end,
+        warn = function() end,
+        err  = function() end,
     }
 end
 

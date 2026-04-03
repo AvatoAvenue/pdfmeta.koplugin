@@ -154,7 +154,7 @@ function PdfMeta:processFile(pdf_file)
 
     logger.dbg("PdfMeta -> processFile meta:", meta)
 
-    -- Locate (or create) the .sdr sidecar directory for this book.
+    -- Locate or create the .sdr sidecar directory for this book.
     -- DocSettings:getSidecarDir() returns e.g. /path/to/Book.sdr
     local sdr_dir = DocSettings:getSidecarDir(pdf_file)
     ensureDir(sdr_dir)
@@ -311,7 +311,7 @@ function PdfMeta:onPdfMeta()
     Trapper:wrap(function()
         local go_on = Trapper:confirm(
             _([[
-This will import Calibre metadata (series, series index, language)
+This will import Calibre metadata (series, series index and language)
 from the .metadata.calibre file in the current directory into each
 book's KOReader sidecar, so they appear in "Book information".
 
